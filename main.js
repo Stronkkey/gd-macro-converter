@@ -298,6 +298,63 @@ function parseMHRjson(text) {
     return {fps, actions};
 }
 
+function parseMHR(view, frame=false) {
+    /** See https://github.com/matcool/gd-macro-converter/issues/5
+    * File layout
+    * ??? at 0x0 to 0x0b (string maybe)
+    * int32 at 0x0c (fps)
+    * int16 at 0x1c (total clicks)
+    * first action at 0x22
+    */
+
+    const fps = view.getInt32(0xc, true);
+    const action_size = 0x20;
+    const actions_count = view.getInt16(0x1c, true);
+
+    /**
+    * Action layout
+    * uint8 at 0x0 (plr1)
+    * uint8 at 0x1 (plr2)
+    * int16 at 0x2 (frame)
+    * float32 at 0x8 (x pos)
+    * float32 at 0xc (y pos)
+    * float32 at 0x10 (rotation)
+    * float64 at 0x18 (y accel)
+    */
+    const actions = [];
+
+    let prev_p1 = false;
+    let prev_p2 = false;
+    for (let i = 0; i < actions_count; i++) {
+        const action_pos = (i * action_size) + 0x22; // Offset from beginning
+        const plr1 = view.getUint8(action_pos) == 1;
+        const plr2 = view.getUint8(action_pos + 0x1) == 1;
+        const x = frame ? view.getInt16(action_pos + 0x2, true) : view.getFloat32(action_pos + 0x6, true);
+        console.log(action_pos);
+
+        if (plr1)
+            actions.push({x, hold: plr1, player2: false});
+
+        // The holding state is not saved so just release if the player is being held
+        if (!plr1 && prev_p1)
+            actions.push({x, hold: false, player2: false})
+
+        if (plr2)
+            actions.push({x, hold: plr2, player2: false});
+
+        // The holding state is not saved so just release if the player is being held
+        if (!plr2 && prev_p2)
+            actions.push({x, hold: false, player2: true})
+
+        if (!prev_p1)
+            prev_p1 = plr1;
+
+        if (!prev_p2)
+            prev_p2 = plr2;  
+    }
+
+    return {fps, actions};
+}
 
 function dumpTxt(replay) {
     let final = '';
@@ -525,6 +582,60 @@ function dumpMHRjson(replay) {
     return JSON.stringify(data, null, 1);
 }
 
+function dumpMHR(replay, frame=false) {
+    /** See https://github.com/matcool/gd-macro-converter/issues/5
+    * File layout
+    * "HACKPRO" at 0x0 to 0xb (string)
+    * int32 at 0xc (fps)
+    * "ABSNLUTE" at 0x10 to 0x1b (string)
+    * int16 at 0x1c (total clicks)
+    * first action at 0x22
+    */
+
+    /**
+    * Action layout
+    * uint8 at 0x0 (plr1)
+    * uint8 at 0x1 (plr2)
+    * int16 at 0x2 (frame)
+    * float32 at 0x8 (x pos)
+    * float32 at 0xc (y pos)
+    * float32 at 0x10 (rotation)
+    * float64 at 0x18 (y accel)
+    */
+    const action_size = 0x20;
+    const action_count = replay.actions.length;
+    
+    const buffer = new ArrayBuffer(0x22 + (action_count * action_size));
+    const view = new DataView(buffer);
+
+    view.setUint32(0x0, 0x4841434b);
+    view.setUint32(0x4, 0x50524f07);
+    view.setUint32(0x8, 0x4000000);
+    view.setInt32(0xc, replay.fps, true);
+    view.setUint32(0x10, 0x4142534e);
+    view.setUint32(0x14, 0x4c555445)
+    view.setUint32(0x18, 0x20000000);
+    view.setInt16(0x1c, action_count, true);
+    view.setUint8(0x20, 0x2);
+
+    let i = 0;
+    replay.actions.forEach((action) => {
+        const action_offset = (i * action_size) + 0x22;
+
+        view.setUint8(action_offset, (action.hold && !action.player2) ? 1 : 0);
+        view.setUint8(action_offset + 0x1, (action.hold && action.player2) ? 1 : 0);
+        view.setInt16(action_offset + 0x2, frame ? action.x : 0, true);
+        view.setFloat32(action_offset + 0x8, !frame ? action.x : 0, true);
+        view.setFloat32(action_offset + 0xc, 0, true);
+        view.setFloat32(action_offset + 0x10, 0, true);
+        view.setFloat64(action_offset + 0x18, 0, true);
+
+        i++;
+    })
+
+    return buffer;
+}
+
 function cleanReplay(replay) {
     let last1 = false;
     let last2 = false;
@@ -563,7 +674,9 @@ const extensions = {
     'url': 'replay',
     'url-f': 'replay',
     'rush': 'rsh',
-	'mhrjson': 'json'
+	'mhrjson': 'json',
+    'mhr': 'mhr',
+    'mhr-f': 'mhr'
 }
 
 document.getElementById('select-from').addEventListener('change', e => {
@@ -636,6 +749,12 @@ document.getElementById('btn-convert').addEventListener('click', async () => {
                 case 'mhrjson':
                     replay = parseMHRjson(await files[0].text());
                     break;
+                case 'mhr':
+                    replay = parseMHR(view);
+                    break;
+                case 'mhr-f':
+                    replay = parseMHR(view, true);
+                    break;
             }
             if (to === 'txt') {
                 // if converting to plain text then switch
@@ -704,6 +823,12 @@ document.getElementById('btn-convert').addEventListener('click', async () => {
             case 'mhrjson':
                 saveAs(new Blob([dumpMHRjson(replay)], {type: 'application/json'}), 'converted.mhr.json');
                 return;
+            case 'mhr':
+                buffer = dumpMHR(replay);
+                break;
+            case 'mhr-f':
+                buffer = dumpMHR(replay, true);
+                break;
         }
 
         saveAs(new Blob([buffer], {type: 'application/octet-stream'}), extensions[to] ? 'converted.' + extensions[to] : 'converted');
